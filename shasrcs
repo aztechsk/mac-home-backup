@@ -1,0 +1,29 @@
+#!/bin/sh
+# Project checksum: SHA-256 of the sorted per-file SHA-256 listing.
+set -eu
+
+cd "$(dirname "$0")"
+
+if command -v sha256sum >/dev/null 2>&1; then
+	file_sha256() { sha256sum -- "$1"; }
+	list_sha256() { sha256sum; }
+elif command -v shasum >/dev/null 2>&1; then
+	file_sha256() { shasum -a 256 -- "$1"; }
+	list_sha256() { shasum -a 256; }
+else
+	printf '%s\n' 'shasrcs: no SHA-256 utility found' >&2
+	exit 1
+fi
+
+for file in README.md mac-home-backup; do
+	if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+		printf 'shasrcs: missing or unreadable file: %s\n' "$file" >&2
+		exit 1
+	fi
+done
+
+# Names are in LC_ALL=C order; hash the names as well as file contents.
+readme_sum=$(file_sha256 README.md)
+script_sum=$(file_sha256 mac-home-backup)
+project_sum=$(printf '%s\n%s\n' "$readme_sum" "$script_sum" | list_sha256)
+printf '%s\n' "${project_sum%% *}"

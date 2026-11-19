@@ -1,0 +1,1553 @@
+#!/usr/bin/perl
+
+# mac-home-backup
+#
+# Autors: Jan Rusnak
+# (C) 2026
+
+use warnings;
+use strict;
+use Getopt::Long ();
+use Encode ();
+use Fcntl ();
+use IO::Select ();
+use POSIX ();
+use File::Temp ();
+use File::Path ();
+use JSON::PP ();
+use Digest::SHA ();
+use Unicode::Normalize ();
+
+my $program = 'mac-home-backup';
+my $version = "$program v0.1";
+
+# Allow tests to load command helpers without running the CLI.
+exit(main()) unless caller();
+
+sub main {
+	local $| = 1;  # Show each phase before a potentially long operation.
+	local $SIG{TERM} = 'IGNORE';
+	local $SIG{HUP} = 'IGNORE';
+	$SIG{PIPE} = 'IGNORE';  # Keep ignored through final stdout flush at process exit.
+	umask(0077);
+
+	eval {
+		my $options = parse_options();
+		my $home = $ENV{HOME};
+		die("HOME is not set\n") unless (defined($home) && length($home));
+		die("HOME must be an absolute path\n") unless ($home =~ m{\A/});
+		die("HOME directory '$home' does not exist\n") unless (-d $home);
+		if ($options->{operation} eq 'backup') {
+			my $mode = $options->{mode};
+			my $fn = "$home/.mac-home-backup";
+			progress_msg('Loading configuration...');
+			my $cfg = parse_config($fn);
+			if ($mode eq 'library' && !@{$cfg->{library_include}}) {
+				die("No 'library_include' entries in configuration file '$fn'\n");
+			}
+			stage_backup($home, $mode, $cfg);
+		} else {
+			my $plan = restore_preflight($home, $options->{archive}, $options->{paths});
+			restore_selected($options->{archive}, $plan);
+		}
+	};
+	if ($@) {
+		my $error = $@;
+		my $message = "$program: $error";
+		$message = Encode::encode('UTF-8', $message) if (utf8::is_utf8($message));
+		print STDERR ($message);
+		return 1;
+	}
+	return 0;
+}
+
+sub progress_msg {
+	my $message = shift();
+
+	print STDOUT ("$program: $message\n") or die("Cannot write progress to stdout. System error: $!\n");
+}
+
+# Archive and verify against the mounted snapshot before releasing it.
+sub stage_backup {
+	my ($home, $mode, $cfg) = @_;
+	my ($archive, $manifest, $entries, $digest);
+	my $published = 0;
+	my $timestamp = POSIX::strftime('%Y%m%d%H%M%S', localtime());
+	my ($hostname, $user) = archive_identity();
+
+	my $ok = eval {
+		local $SIG{INT} = sub { die("Interrupted by SIGINT\n") };
+		with_apfs_snapshot('/System/Volumes/Data', sub {
+			my ($mountpoint) = @_;
+			progress_msg('Validating source paths...');
+			my $root = snapshot_source_root($mountpoint, $home, $mode);
+			my @paths = resolve_filter_paths($root, $mode, $cfg);
+			progress_msg($mode eq 'home' ? 'Skipped (home):' : 'Including (library):');
+			foreach my $path (@paths) {
+				progress_msg('  ' . Encode::encode('UTF-8', $path));
+			}
+			my @filters = aa_filter_args($mode, \@paths);
+			progress_msg('Checking source access...');
+			my $counts = check_source_access($root, $mode, \@paths);
+			progress_msg(sprintf('Preflight OK (%s): %d directories, %d files, %d symlinks; ' .
+				'%d special skipped.', $mode, @{$counts}{qw(directories files symlinks special)}));
+			progress_msg('Creating temporary archive...');
+			{
+				local $SIG{INT} = 'IGNORE';
+				$archive = new_staged_file('archive');
+			}
+			progress_msg('Creating Apple Archive...');
+			archive_snapshot($root, $archive, \@filters);
+			progress_msg('Checking archive entries...');
+			$entries = check_staged_archive($archive);
+			my $expected = $counts->{directories} + $counts->{files} + $counts->{symlinks};
+			die("Archive entry count mismatch: expected $expected, found $entries\n")
+				unless ($entries == $expected);
+			progress_msg('Creating archive manifest...');
+			{
+				local $SIG{INT} = 'IGNORE';
+				$manifest = new_staged_file('manifest');
+			}
+			run_cmd('/usr/bin/aa', 'convert', '-manifest', '-i', $archive, '-o', $manifest);
+			lstat($manifest) or die("Cannot access archive manifest '$manifest'. System error: $!\n");
+			die("Invalid or empty archive manifest '$manifest'\n") unless (-f _ && !-l _ && -s _);
+			progress_msg('Verifying archive manifest against snapshot...');
+			run_cmd('/usr/bin/aa', 'verify', '-v', '-i', $manifest, '-d', $root, @filters);
+			unlink($manifest) or die("Cannot remove archive manifest '$manifest'. System error: $!\n");
+			undef($manifest);
+			return $counts;
+		}, \&progress_msg);
+		progress_msg('Computing archive SHA-256...');
+		$digest = archive_sha256($archive);
+		{
+			local $SIG{INT} = 'IGNORE';
+			$archive = publish_staged_archive($archive, $mode, $timestamp, $hostname, $user, $digest);
+			$published = 1;
+		}
+		1;
+	};
+	unless ($ok) {
+		my $error = $@;
+		{
+			local $SIG{INT} = 'IGNORE';
+			local $SIG{TERM} = 'IGNORE';
+			eval { discard_staged_archive($published ? undef : $archive, $manifest); 1 }
+				or $error .= "Cannot clean up temporary files: $@";
+		}
+		die($error);
+	}
+	progress_msg("Archive published (MANIFEST VERIFIED): $archive ($entries entries).");
+	progress_msg("SHA-256: $digest");
+	return $archive;
+}
+
+# Validate restore input and selectors without extracting or modifying destinations.
+sub restore_preflight {
+	my ($home, $archive, $paths) = @_;
+	my ($mode, $index, $selected);
+
+	progress_msg('Checking restore archive...');
+	$mode = check_restore_archive($archive);
+	my $archive_state = restore_path_state($archive);
+	progress_msg('Verifying restore archive SHA-256...');
+	check_restore_archive_digest($archive);
+	progress_msg('Reading restore archive entries...');
+	$index = restore_archive_index($archive);
+	assert_restore_state($archive, $archive_state);
+	progress_msg('Validating selected restore paths...');
+	$selected = select_restore_paths($paths, $index);
+	my $root = $mode eq 'home' ? $home : "$home/Library";
+	progress_msg('Checking restore destination parents...');
+	check_restore_target_parents($root, $selected);
+	progress_msg("Restore preflight OK ($mode): " . scalar(@{$selected}) . ' selected objects; ' .
+		$index->{count} . ' archive entries.');
+	progress_msg("Destination root: $root");
+	foreach my $entry (@{$selected}) {
+		progress_msg('  ' . Encode::encode('UTF-8', $entry->{path}) . " ($entry->{type})");
+	}
+	return { mode => $mode, root => $root, selected => $selected, index => $index,
+		archive_state => $archive_state };
+}
+
+# Extract all selections once, then replace and verify each object independently.
+sub restore_selected {
+	my ($archive, $plan) = @_;
+	my ($root, $stage, $manifest, $stage_state, $error);
+	my (%original, %parent_states);
+
+	$root = $plan->{root};
+	check_restore_target_parents($root, $plan->{selected}, \%parent_states);
+	local $SIG{INT} = 'IGNORE';
+	my $ok = eval {
+		local $SIG{INT} = sub { die("Interrupted by SIGINT\n") };
+		progress_msg('Recording restore target state...');
+		foreach my $entry (@{$plan->{selected}}) {
+			my $path = Encode::encode('UTF-8', $entry->{path});
+			$original{$entry->{path}} = restore_path_state("$root/$path");
+		}
+		progress_msg('Creating private restore staging directory...');
+		{
+			local $SIG{INT} = 'IGNORE';
+			$stage = File::Temp::tempdir('.mac-home-backup-restore-XXXXXXXX', DIR => $root, CLEANUP => 0);
+		}
+		$stage_state = restore_path_state($stage);
+		my @stage_info = lstat($stage);
+		die("Unsafe restore staging directory '$stage'\n")
+			unless (@stage_info && -d _ && !-l _ && $stage_info[4] == $< &&
+				($stage_info[2] & 07777) == 0700);
+		assert_restore_state($archive, $plan->{archive_state});
+		progress_msg('Creating restore archive manifest...');
+		{
+			local $SIG{INT} = 'IGNORE';
+			$manifest = new_staged_file('manifest');
+		}
+		run_cmd('/usr/bin/aa', 'convert', '-manifest', '-i', $archive, '-o', $manifest);
+		my @manifest_info = lstat($manifest);
+		die("Invalid or empty restore manifest '$manifest'\n")
+			unless (@manifest_info && -f _ && !-l _ && $manifest_info[7] > 0);
+		assert_restore_state($archive, $plan->{archive_state});
+		progress_msg('Extracting selected restore objects...');
+		my @filters = map { ('-include-path', Encode::encode('UTF-8', $_->{path})) } @{$plan->{selected}};
+		run_cmd('/usr/bin/aa', 'extract', '-i', $archive, '-d', $stage,
+			'-no-ignore-eperm', @filters);
+		assert_restore_identity($stage, $stage_state);
+		assert_restore_state($archive, $plan->{archive_state});
+		my @stage_info_after = lstat($stage);
+		die("Restore staging directory permissions changed '$stage'\n")
+			unless (@stage_info_after && $stage_info_after[4] == $< &&
+				($stage_info_after[2] & 07777) == 0700);
+		progress_msg('Checking extracted restore objects...');
+		check_restore_stage($stage, $plan->{index}, $plan->{selected});
+		foreach my $entry (@{$plan->{selected}}) {
+			my $path = Encode::encode('UTF-8', $entry->{path});
+			progress_msg("Installing and verifying '$path'...");
+			restore_replace_one($root, $stage, $manifest, $entry,
+				$original{$entry->{path}}, \%parent_states);
+			progress_msg("Restored and verified '$path'.");
+		}
+		1;
+	};
+	$error = $@ unless ($ok);
+	{
+		local $SIG{INT} = 'IGNORE';
+		if (defined($manifest)) {
+			unlink($manifest) or $error .= "Cannot remove restore manifest '$manifest'. System error: $!\n";
+		}
+		if (defined($stage)) {
+			eval {
+				assert_restore_identity($stage, $stage_state);
+				remove_restore_object($stage);
+				1;
+			} or $error .= "Cannot clean restore staging '$stage': $@";
+		}
+	}
+	die($error) if (defined($error) && length($error));
+	progress_msg('Restore complete (all selected objects verified).');
+	return 1;
+}
+
+# Snapshot target metadata to detect changes between preflight and each rename.
+# A missing target is valid, unlike a missing ancestor.
+sub restore_path_state {
+	my $path = shift();
+
+	my @info = lstat($path);
+	if (!@info) {
+		die("Cannot inspect restore object '$path'. System error: $!\n") unless ($!{ENOENT});
+		return undef;
+	}
+	return [@info[0, 1, 2, 7, 9, 10]];
+}
+
+sub assert_restore_state {
+	my ($path, $expected) = @_;
+	my $actual = restore_path_state($path);
+
+	die("Restore object changed during operation '$path'\n")
+		unless (defined($actual) == defined($expected) &&
+			(!defined($expected) || join(',', @{$actual}) eq join(',', @{$expected})));
+	return 1;
+}
+
+# Rename preserves inode/type, although metadata timestamps may change.
+sub assert_restore_identity {
+	my ($path, $expected) = @_;
+	my $actual = restore_path_state($path);
+
+	die("Restore object disappeared or was replaced '$path'\n")
+		unless (defined($expected) && defined($actual) &&
+			$actual->[0] == $expected->[0] && $actual->[1] == $expected->[1] &&
+			($actual->[2] & 0170000) == ($expected->[2] & 0170000));
+	return 1;
+}
+
+# Ensure extraction produced exactly the selected records and only implicit directories.
+sub check_restore_stage {
+	my ($stage, $index, $selected) = @_;
+	my %expected;
+	my $found = 0;
+
+	foreach my $entry (@{$selected}) {
+		my $prefix = "$entry->{path}/";
+		foreach my $path (keys(%{$index->{exact}})) {
+			next unless ($path eq $entry->{path} || index($path, $prefix) == 0);
+			$expected{Unicode::Normalize::NFC($path)} = $index->{exact}{$path};
+		}
+		my @parts = split(m{/}, $entry->{path});
+		pop(@parts);
+		my $parent = '';
+		foreach my $part (@parts) {
+			$parent = length($parent) ? "$parent/$part" : $part;
+			$expected{Unicode::Normalize::NFC($parent)} //= 'D';
+		}
+	}
+	my $walk;
+	$walk = sub {
+		my ($directory, $relative) = @_;
+		my ($dh, @names);
+
+		opendir($dh, $directory) or die("Cannot inspect restore staging '$directory'. System error: $!\n");
+		{
+			local $! = 0;
+			@names = readdir($dh);
+			my $err = "$!" if ($!);
+			my $closed = closedir($dh);
+			die("Cannot read restore staging '$directory'. System error: $err\n") if (defined($err));
+			die("Cannot close restore staging '$directory'. System error: $!\n") unless ($closed);
+		}
+		foreach my $name (@names) {
+			next if ($name eq '.' || $name eq '..');
+			my $decoded = eval { Encode::decode('UTF-8', $name, Encode::FB_CROAK | Encode::LEAVE_SRC) };
+			die("Invalid UTF-8 filename in restore staging '$directory'\n") if ($@);
+			my $path = length($relative) ? "$relative/$decoded" : $decoded;
+			my $key = Unicode::Normalize::NFC($path);
+			my $type = delete($expected{$key});
+			die("Unexpected or duplicate extracted restore object '$path'\n") unless (defined($type));
+			my $absolute = "$directory/$name";
+			lstat($absolute) or die("Cannot inspect extracted object '$absolute'. System error: $!\n");
+			die("Extracted object type mismatch '$path' (expected $type)\n")
+				unless (($type eq 'D' && -d _ && !-l _) || ($type eq 'F' && -f _ && !-l _) ||
+					($type eq 'L' && -l _));
+			$found++;
+			$walk->($absolute, $path) if ($type eq 'D');
+		}
+	};
+	$walk->($stage, '');
+	die("Restore extraction missing " . scalar(keys(%expected)) . " expected objects\n") if (%expected);
+	return $found;
+}
+
+# A single selected root is the unit of replacement and rollback.
+sub restore_replace_one {
+	my ($root, $stage, $manifest, $entry, $expected, $parents) = @_;
+	my ($vault, $saved, $failed, $error, $rollback_error, $vault_state);
+	my ($moved_old, $installed) = (0, 0);
+	my $relative = Encode::encode('UTF-8', $entry->{path});
+	my $target = "$root/$relative";
+	my $source = "$stage/$relative";
+	my $parent = $target;
+
+	$parent =~ s{/[^/]+\z}{} or die("Invalid restore target '$target'\n");
+	check_restore_target_parents($root, [$entry], $parents);
+	assert_restore_state($target, $expected);
+	check_restore_target_parents($stage, [$entry]);
+	my $source_state = restore_path_state($source);
+	die("Missing extracted restore object '$source'\n") unless (defined($source_state));
+	my @parent_info = lstat($parent);
+	my @stage_info = lstat($stage);
+	die("Restore staging and target are on different filesystems ('$source', '$target')\n")
+		unless (@parent_info && @stage_info && $parent_info[0] == $stage_info[0] &&
+			$source_state->[0] == $parent_info[0] &&
+			(!defined($expected) || $expected->[0] == $parent_info[0]));
+	local $SIG{INT} = 'IGNORE';  # Protect the reservation-to-cleanup lifetime.
+	{
+		local $SIG{INT} = 'IGNORE';
+		$vault = File::Temp::tempdir('.mac-home-backup-old-XXXXXXXX', DIR => $parent, CLEANUP => 0);
+	}
+	$saved = "$vault/original";
+	$failed = "$vault/failed";
+	$vault_state = restore_path_state($vault);
+	my $ok = eval {
+		local $SIG{INT} = sub { die("Interrupted by SIGINT\n") };
+		die("Unsafe restore old-object reservation '$vault'\n")
+			unless (defined($vault_state) && -d $vault && !-l $vault &&
+				($vault_state->[2] & 07777) == 0700 && $vault_state->[0] == $source_state->[0]);
+		check_restore_target_parents($root, [$entry], $parents);
+		assert_restore_identity($vault, $vault_state);
+		assert_restore_state($target, $expected);
+		assert_restore_identity($source, $source_state);
+		{
+			local $SIG{INT} = 'IGNORE';
+			if (defined($expected)) {
+				restore_rename($target, $saved)
+					or die("Cannot preserve restore target '$target' as '$saved'. " .
+						"System error: $!\n");
+				$moved_old = 1;
+			}
+			assert_restore_state($target, undef);
+			restore_rename($source, $target)
+				or die("Cannot install extracted restore object '$source' as '$target'. " .
+					"System error: $!\n");
+			$installed = 1;
+		}
+		check_restore_target_parents($root, [$entry], $parents);
+		assert_restore_identity($target, $source_state);
+		run_cmd('/usr/bin/aa', 'verify', '-v', '-i', $manifest, '-d', $root,
+			'-include-path', $relative, '-exclude-field', 'xat');
+		check_restore_target_parents($root, [$entry], $parents);
+		assert_restore_identity($target, $source_state);
+		1;
+	};
+	$error = $@ unless ($ok);
+	if (defined($error)) {
+		local $SIG{INT} = 'IGNORE';
+		if ($installed) {
+			my $moved = eval {
+				assert_restore_identity($vault, $vault_state);
+				assert_restore_identity($target, $source_state);
+				restore_rename($target, $failed)
+					or die("Cannot quarantine unverified restore '$target' as '$failed'. " .
+						"System error: $!\n");
+				1;
+			};
+			$rollback_error .= $@ unless ($moved);
+		}
+		if ($moved_old) {
+			my $recovered = eval {
+				assert_restore_identity($vault, $vault_state);
+				assert_restore_state($target, undef);
+				restore_rename($saved, $target)
+					or die("Cannot roll back original '$saved' to '$target'. System error: $!\n");
+				assert_restore_identity($target, $expected);
+				1;
+			};
+			$rollback_error .= $@ unless ($recovered);
+		} else {
+			eval { assert_restore_state($target, $expected); 1 } or $rollback_error .= $@;
+		}
+		if (defined($rollback_error)) {
+			$error .= "Restore rollback FAILED; examine retained directory '$vault':\n$rollback_error";
+		} else {
+			eval {
+				assert_restore_identity($vault, $vault_state);
+				remove_restore_object($failed) if ($installed);
+				rmdir($vault) or die("Cannot remove restore reservation '$vault'. System error: $!\n");
+				1;
+			}
+				or $error .= "Cannot clean failed restore '$vault': $@";
+		}
+		die($error);
+	}
+	# Verification succeeded: cleanup is post-commit and must never roll back a partially deleted original.
+	{
+		local $SIG{INT} = 'IGNORE';
+		assert_restore_identity($vault, $vault_state);
+		if ($moved_old) {
+			eval { remove_restore_object($saved); 1 }
+				or die("Restored '$target' and verified, but cannot delete old object '$saved': $@");
+		}
+		rmdir($vault)
+			or die("Restored '$target' and verified, but cannot remove reservation '$vault'. " .
+				"System error: $!\n");
+	}
+	return 1;
+}
+
+# Isolated wrapper permits a real application test to inject a failed second rename.
+sub restore_rename {
+	return rename($_[0], $_[1]);
+}
+
+# Never traverse a symlink when cleaning discarded/staged trees.
+sub remove_restore_object {
+	my $path = shift();
+
+	lstat($path) or die("Cannot inspect cleanup object '$path'. System error: $!\n");
+	if (-d _ && !-l _) {
+		my $errors;
+		File::Path::remove_tree($path, { safe => 1, error => \$errors });
+		if ($errors && @{$errors}) {
+			my @details = map { join(': ', %$_) } @{$errors};
+			die("Cannot remove restore directory '$path': " . join('; ', @details) . "\n");
+		}
+		my @remaining = lstat($path);
+		die("Restore directory cleanup incomplete '$path'\n") if (@remaining);
+		die("Cannot inspect removed restore directory '$path'. System error: $!\n")
+			unless ($!{ENOENT});
+	} else {
+		unlink($path) or die("Cannot remove restore object '$path'. System error: $!\n");
+	}
+	return 1;
+}
+
+# The archive filename determines the restore scope; do not infer it from a substring.
+sub check_restore_archive {
+	my $archive = shift();
+	my ($fh, @path_stat, @fd_stat);
+	my $name = $archive;
+
+	$name =~ s{.*/}{};
+	my ($mode) = $name =~
+		/\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?-
+		[A-Za-z0-9_][A-Za-z0-9_.-]*-(home|library)-[0-9]{14}-[0-9a-f]{16}\.aar\z/x;
+	die("Invalid restore archive filename '$name'\n") unless (defined($mode));
+	@path_stat = lstat($archive);
+	die("Cannot access restore archive '$archive'. System error: $!\n") unless (@path_stat);
+	die("Restore archive '$archive' is not a regular file\n") unless (-f _ && !-l _);
+	die("Restore archive '$archive' is empty\n") unless ($path_stat[7] > 0);
+	sysopen($fh, $archive, Fcntl::O_RDONLY() | Fcntl::O_NOFOLLOW())
+		or die("Cannot open restore archive '$archive'. System error: $!\n");
+	@fd_stat = stat($fh);
+	unless (@fd_stat && -f $fh && $path_stat[0] == $fd_stat[0] &&
+		$path_stat[1] == $fd_stat[1] && $path_stat[7] == $fd_stat[7]) {
+		close($fh);
+		die("Restore archive '$archive' changed while opening\n");
+	}
+	close($fh) or die("Cannot close restore archive '$archive'. System error: $!\n");
+	return $mode;
+}
+
+# Detect an altered or incomplete archive before attempting any destination writes.
+# The filename digest is an integrity marker, not proof of archive authenticity.
+sub check_restore_archive_digest {
+	my $archive = shift();
+
+	my ($expected) = $archive =~ /-([0-9a-f]{16})\.aar\z/;
+	die("Restore archive '$archive' has no SHA-256 suffix\n") unless (defined($expected));
+	my $digest = archive_sha256($archive);
+	die("Restore archive SHA-256 mismatch for '$archive': expected prefix $expected, got $digest\n")
+		unless (substr($digest, 0, 16) eq $expected);
+	return 1;
+}
+
+# A missing or symlink ancestor cannot be created/followed by selective restore.
+# The selected target itself is intentionally not checked here: it may be absent or a symlink.
+sub check_restore_target_parents {
+	my ($root, $selected, $states) = @_;
+	my %seen;
+
+	die("Invalid restore destination root '$root'\n")
+		unless (defined($root) && $root =~ m{\A/(?:[^/]+)(?:/[^/]+)*\z});
+	my @root_parts = split(m{/}, substr($root, 1), -1);
+	die("Unsafe restore destination root '$root'\n")
+		if (grep { $_ eq '' || $_ eq '.' || $_ eq '..' } @root_parts);
+	foreach my $entry (@{$selected}) {
+		my @parents = split(m{/}, $entry->{path}, -1);
+		pop(@parents);
+		my $current = '';
+		foreach my $part (@root_parts, @parents) {
+			$current .= "/$part";
+			next if ($seen{$current}++);
+			my @info = lstat($current);
+			die("Cannot access restore destination parent '$current'. System error: $!\n") unless (@info);
+			die("Restore destination parent '$current' is a symbolic link\n") if (-l _);
+			die("Restore destination parent '$current' is not a directory\n") unless (-d _);
+			if (defined($states)) {
+				my $id = join(':', @info[0, 1, 2]);
+				die("Restore destination parent changed '$current'\n")
+					if (exists($states->{$current}) && $states->{$current} ne $id);
+				$states->{$current} = $id;
+			}
+		}
+	}
+	check_restore_target_spelling($root, $selected);
+	return 1;
+}
+
+# On case-insensitive filesystems, lstat() can resolve a different on-disk spelling.
+# Allow Unicode canonical equivalence, but never a case-only alias of an existing object.
+sub check_restore_target_spelling {
+	my ($root, $selected) = @_;
+
+	foreach my $entry (@{$selected}) {
+		my $absolute = "$root/" . Encode::encode('UTF-8', $entry->{path});
+		my @components = split(m{/}, substr($absolute, 1), -1);
+		my $directory = '';
+		foreach my $i (0 .. $#components) {
+			my $component = $components[$i];
+			my $next = "$directory/$component";
+			my @info = lstat($next);
+			if (!@info) {
+				last if ($i == $#components && $!{ENOENT});  # A new target is allowed.
+				die("Cannot inspect restore destination '$next'. System error: $!\n");
+			}
+			if ($i < $#components) {
+				die("Unsafe restore destination ancestor '$next'\n") if (-l _ || !-d _);
+			}
+			my $wanted = eval { Encode::decode('UTF-8', $component, Encode::FB_CROAK | Encode::LEAVE_SRC) };
+			die("Invalid UTF-8 in restore destination '$next'\n") if ($@);
+			$wanted = Unicode::Normalize::NFC($wanted);
+			my $parent = length($directory) ? $directory : '/';
+			my ($dh, @names, $matches);
+			opendir($dh, $parent)
+				or die("Cannot read restore destination directory '$parent'. System error: $!\n");
+			{
+				local $! = 0;
+				@names = readdir($dh);
+				my $error = "$!" if ($!);
+				my $closed = closedir($dh);
+				die("Cannot read restore destination directory '$parent'. System error: $error\n")
+					if (defined($error));
+				die("Cannot close restore destination directory '$parent'. System error: $!\n")
+					unless ($closed);
+			}
+			$matches = 0;
+			foreach my $name (@names) {
+				next if ($name eq '.' || $name eq '..');
+				my $decoded = eval {
+					Encode::decode('UTF-8', $name, Encode::FB_CROAK | Encode::LEAVE_SRC)
+				};
+				next if ($@);
+				$matches++ if (Unicode::Normalize::NFC($decoded) eq $wanted);
+			}
+			die("Restore destination spelling mismatch '$next'\n") unless ($matches == 1);
+			$directory = $next;
+		}
+	}
+	return 1;
+}
+
+# Index only recorded filesystem entries. Missing implicit parents are not selectable.
+sub restore_archive_index {
+	my $archive = shift();
+	my (%exact, %normalized, %folded);
+
+	my @listing = exec_cmd('/usr/bin/aa', 'list', '-i', $archive,
+		'-list-format', 'json', '-exclude-field', 'all', '-include-field', 'pat,typ');
+	my $records = eval { JSON::PP::decode_json(join('', @listing)) };
+	die("Cannot decode restore archive listing '$archive': $@") if ($@);
+	die("Invalid restore archive listing '$archive'\n") unless (ref($records) eq 'ARRAY' && @{$records});
+	my $entry_number = 0;
+	foreach my $record (@{$records}) {
+		$entry_number++;
+		die("Invalid restore archive entry in '$archive'\n") unless (ref($record) eq 'HASH');
+		my ($path, $type) = @{$record}{qw(PAT TYP)};
+		die("Invalid restore archive entry type in '$archive'\n")
+			unless (defined($type) && !ref($type) && $type =~ /\A[DFL]\z/);
+		# Apple Archive records its root directory as the first entry with PAT="".
+		if (defined($path) && !ref($path) && $path eq '') {
+			die("Invalid restore archive root entry in '$archive'\n")
+				unless ($entry_number == 1 && $type eq 'D');
+			next;  # Root is not a selectable relative path.
+		}
+		validate_restore_path($path, 'Archive entry');
+		die("Duplicate restore archive entry '$path'\n") if (exists($exact{$path}));
+		my $key = Unicode::Normalize::NFC($path);
+		if (exists($normalized{$key})) {
+			die("Unicode-equivalent restore archive entries '$normalized{$key}' and '$path'\n");
+		}
+		my $fold = CORE::fc($key);
+		die("Case-equivalent restore archive entries '$folded{$fold}' and '$path'\n")
+			if (exists($folded{$fold}));
+		$exact{$path} = $type;
+		$normalized{$key} = $path;
+		$folded{$fold} = $path;
+	}
+	# A parent present as a symlink or file must never be traversed during extraction.
+	# Check implicit ancestors too: Library archives may omit their PAT records.
+	my %ancestors;
+	foreach my $path (keys(%exact)) {
+		my @parts = split(m{/}, $path);
+		pop(@parts);
+		my $parent = '';
+		foreach my $part (@parts) {
+			$parent = length($parent) ? "$parent/$part" : $part;
+			my $key = CORE::fc(Unicode::Normalize::NFC($parent));
+			die("Case/Unicode-equivalent restore archive ancestors '$ancestors{$key}' and '$parent'\n")
+				if (exists($ancestors{$key}) && $ancestors{$key} ne $parent);
+			$ancestors{$key} = $parent;
+			my $actual = $folded{$key};
+			next unless (defined($actual));  # Library backups may omit parent PAT records.
+			die("Inconsistent archive ancestor '$parent' for '$path'\n") unless ($actual eq $parent);
+			die("Non-directory archive ancestor '$parent' for '$path'\n")
+				unless ($exact{$actual} eq 'D');
+		}
+	}
+	return { exact => \%exact, normalized => \%normalized, count => scalar(@{$records}) };
+}
+
+sub validate_restore_path {
+	my ($path, $kind) = @_;
+
+	die("$kind has an invalid relative path\n") unless (defined($path) && !ref($path) && length($path));
+	die("$kind contains an unsafe control character\n") if ($path =~ /\p{Cc}/);
+	my @parts = split(m{/}, $path, -1);
+	die("Invalid $kind path '$path'\n")
+		if ($path =~ m{\A/} || grep { $_ eq '' || $_ eq '.' || $_ eq '..' } @parts);
+	eval { Encode::encode('UTF-8', $path, Encode::FB_CROAK | Encode::LEAVE_SRC); 1 }
+		or die("Invalid Unicode in $kind path\n");
+	return $path;
+}
+
+# Match unique Unicode-equivalent PAT spelling; keep the archive's spelling for aa.
+sub select_restore_paths {
+	my ($paths, $index) = @_;
+	my @selected;
+
+	foreach my $raw (@{$paths}) {
+		my $path = eval { Encode::decode('UTF-8', $raw, Encode::FB_CROAK | Encode::LEAVE_SRC) };
+		die("Invalid UTF-8 in restore path (-p)\n") if ($@);
+		validate_restore_path($path, 'Requested restore');
+		my $key = Unicode::Normalize::NFC($path);
+		my $actual = $index->{normalized}{$key};
+		die("Requested restore path '$path' has no archive PAT record\n") unless (defined($actual));
+		foreach my $old (@selected) {
+			die("Duplicate restore selection '$path'\n") if ($key eq $old->{key});
+			die("Overlapping restore selections '$path' and '$old->{path}'\n")
+				if (index($key, "$old->{key}/") == 0 || index($old->{key}, "$key/") == 0);
+		}
+		push(@selected, { path => $actual, type => $index->{exact}{$actual}, key => $key });
+	}
+	return \@selected;
+}
+
+# Reserve a unique, private file in the shared sticky /private/tmp directory.
+sub new_staged_file {
+	my $kind = shift();
+
+	die("Invalid temporary file type '$kind'\n") unless ($kind eq 'archive' || $kind eq 'manifest');
+	my ($fh, $name) = File::Temp::tempfile("mac-home-backup-$kind-XXXXXXXX",
+		DIR => '/private/tmp', SUFFIX => '.aar', UNLINK => 0);
+	unless (close($fh)) {
+		my $error = "$!";
+		$error .= "\nCannot remove temporary file '$name'. System error: $!" unless (unlink($name));
+		die("Cannot close temporary file '$name'. System error: $error\n");
+	}
+	return $name;
+}
+
+# Use only explicitly selected Apple Archive metadata and compression parameters.
+sub archive_snapshot {
+	my ($root, $archive, $filters) = @_;
+
+	my @info = lstat($archive);
+	die("Unsafe temporary archive '$archive'\n")
+		unless (@info && -f _ && !-l _ && $info[7] == 0 && $info[4] == $< &&
+			($info[2] & 07777) == 0600);
+	run_cmd('/usr/bin/aa', 'archive',
+		'-d', $root,
+		'-o', $archive,
+		'-x',
+		'-a', 'lzfse',
+		'-b', '4m',
+		'-t', '4',
+		'-enable-holes',
+		'-exclude-field', 'all',
+		'-include-field', 'typ,pat,lnk,dev,uid,gid,mod,flg,mtm,ctm,btm,xat,acl,dat,siz,duz,sh2,hlc',
+		@{$filters});
+}
+
+# Structural/nonempty check only: this does NOT verify stored file contents against SH2.
+sub check_staged_archive {
+	my $archive = shift();
+	my @info = lstat($archive);
+
+	die("Cannot access staged archive '$archive'. System error: $!\n") unless (@info);
+	die("Staged archive '$archive' is not a regular file\n") unless (-f _ && !-l _);
+	die("Staged archive '$archive' is empty\n") unless ($info[7] > 0);
+	chmod(0600, $archive) == 1 or die("Cannot protect staged archive '$archive'. System error: $!\n");
+	my @listing = exec_cmd('/usr/bin/aa', 'list', '-i', $archive,
+		'-list-format', 'json', '-exclude-field', 'all', '-include-field', 'pat');
+	my $entries = eval { JSON::PP::decode_json(join('', @listing)) };
+	die("Cannot decode staged archive listing '$archive': $@") if ($@);
+	die("Invalid staged archive listing '$archive'\n") unless (ref($entries) eq 'ARRAY');
+	die("Staged archive '$archive' contains no entries\n") unless (@$entries);
+	return scalar(@$entries);
+}
+
+# Read the complete archive to calculate its transfer/storage identifier.
+sub archive_sha256 {
+	my $archive = shift();
+	my ($fh, $data);
+	my $sha = Digest::SHA->new(256);
+
+	sysopen($fh, $archive, Fcntl::O_RDONLY() | Fcntl::O_NOFOLLOW())
+		or die("Cannot open staged archive '$archive' for SHA-256. System error: $!\n");
+	binmode($fh) or die("Cannot set binary mode on staged archive '$archive'. System error: $!\n");
+	while (1) {
+		my $bytes = sysread($fh, $data, 1024 * 1024);
+		unless (defined($bytes)) {
+			next if ($!{EINTR});
+			my $error = "$!";
+			close($fh);
+			die("Cannot read staged archive '$archive' for SHA-256. System error: $error\n");
+		}
+		last if ($bytes == 0);
+		$sha->add($data);
+	}
+	close($fh) or die("Cannot close staged archive '$archive' after SHA-256. System error: $!\n");
+	return $sha->hexdigest();
+}
+
+# Resolve safe filename components before the expensive snapshot and archive work.
+sub archive_identity {
+	my @out = exec_cmd('/usr/sbin/scutil', '--get', 'LocalHostName');
+
+	die("Cannot identify macOS LocalHostName\n") unless (@out == 1);
+	my $hostname = $out[0];
+	$hostname =~ s/\r?\n\z//;
+	die("Invalid macOS LocalHostName '$hostname'\n")
+		unless ($hostname =~ /\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\z/);
+	my $user = getpwuid($<);
+	die("Invalid current account name\n")
+		unless (defined($user) && $user =~ /\A[A-Za-z0-9_][A-Za-z0-9_.-]*\z/);
+	return ($hostname, $user);
+}
+
+# A hard link atomically publishes the complete file without overwriting another archive.
+sub publish_staged_archive {
+	my ($archive, $mode, $timestamp, $hostname, $user, $digest) = @_;
+	my $final;
+
+	die("Invalid archive mode '$mode'\n") unless ($mode eq 'home' || $mode eq 'library');
+	die("Invalid archive timestamp '$timestamp'\n") unless ($timestamp =~ /\A[0-9]{14}\z/);
+	my $dirname = $archive;
+	$dirname =~ s{/[^/]+\z}{} or die("Invalid staged archive path '$archive'\n");
+	$final = "$dirname/$hostname-$user-$mode-$timestamp-" . substr($digest, 0, 16) . '.aar';
+	link($archive, $final)
+		or die("Cannot publish staged archive '$archive' as '$final'. System error: $!\n");
+	unless (unlink($archive)) {
+		my $error = "$!";
+		unlink($final) or die("Cannot remove temporary archive '$archive' (system error: $error); " .
+			"also cannot retract published archive '$final'. System error: $!\n");
+		die("Cannot remove temporary archive '$archive'. System error: $error\n");
+	}
+	return $final;
+}
+
+# Remove only our known temporary files if any part of the run fails.
+sub discard_staged_archive {
+	my ($archive, $manifest) = @_;
+	my $errors = '';
+
+	foreach my $item (['archive', $archive], ['manifest', $manifest]) {
+		my ($kind, $name) = @{$item};
+		next unless (defined($name));
+		my $pattern = $kind eq 'manifest' ?
+			qr{\A/private/tmp/mac-home-backup-manifest-[A-Za-z0-9_]{8}\.aar\z} :
+			qr{\A/private/tmp/(?:mac-home-backup-archive-[A-Za-z0-9_]{8}|
+				[A-Za-z0-9][A-Za-z0-9._-]*-(?:home|library)-[0-9]{14}-[0-9a-f]{16})\.aar\z}x;
+		die("Unexpected temporary $kind path '$name'\n") unless ($name =~ $pattern);
+		if (lstat($name)) {
+			$errors .= "Cannot remove $kind file '$name'. System error: $!\n" unless (unlink($name));
+		} elsif (!$!{ENOENT}) {
+			$errors .= "Cannot inspect $kind file '$name'. System error: $!\n";
+		}
+	}
+	die($errors) if (length($errors));
+}
+
+# Restore normal signal handling in external commands, except while cleaning up.
+sub reset_child_signals {
+	my $ignore_int = shift();
+
+	$SIG{INT} = $ignore_int ? 'IGNORE' : 'DEFAULT';
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{HUP} = 'DEFAULT';
+	$SIG{PIPE} = 'DEFAULT';
+}
+
+# Capture stdout for commands with small, parseable output; stderr remains inherited.
+sub exec_cmd {
+	my ($cmd, @args) = @_;
+	my ($out_read, $out_write, $pid, $waited, $status);
+	my (@out, $read_error, $close_error);
+	my $interrupted = 0;
+	my $ignore_int = defined($SIG{INT}) && $SIG{INT} eq 'IGNORE';
+
+	# Only kill the child in the handler; close pipes and reap it in normal control flow.
+	local $SIG{INT} = $ignore_int ? 'IGNORE' : sub {
+		$interrupted = 1;
+		kill('KILL', $pid) if (defined($pid) && $pid > 0);
+	};
+	pipe($out_read, $out_write) or die("Cannot create stdout pipe for '$cmd'. System error: $!\n");
+	$pid = fork();
+	unless (defined($pid)) {
+		my $error = "$!";
+		close($out_read);
+		close($out_write);
+		die("Cannot fork '$cmd'. System error: $error\n");
+	}
+	if ($pid == 0) {
+		reset_child_signals($ignore_int);
+		close($out_read);
+		open(STDOUT, '>&', $out_write) or POSIX::_exit(127);
+		close($out_write);
+		{
+			no warnings 'exec';
+			exec { $cmd } $cmd, @args or do {
+				print STDERR ("Cannot execute '$cmd'. System error: $!\n");
+				POSIX::_exit(127);
+			};
+		}
+	}
+	kill('KILL', $pid) if ($interrupted);
+	$close_error = "Cannot close stdout pipe for '$cmd'. System error: $!\n" unless (close($out_write));
+	kill('KILL', $pid) if (defined($close_error));
+	{
+		local $! = 0;
+		@out = <$out_read>;
+		$read_error = "$!" if ($!);
+	}
+	$close_error //= "Cannot close stdout pipe for '$cmd'. System error: $!\n" unless (close($out_read));
+	while (1) {
+		$waited = waitpid($pid, 0);
+		last unless ($waited == -1 && $!{EINTR});
+	}
+	$status = $?;
+	my $child_pid = $pid;
+	$pid = undef;
+	die("Interrupted by SIGINT\n") if ($interrupted);
+	die("Cannot wait for '$cmd'. System error: $!\n") unless ($waited == $child_pid);
+	die("Cannot read stdout from '$cmd'. System error: $read_error\n") if (defined($read_error));
+	die($close_error) if (defined($close_error));
+	check_cmd_status($cmd, $status);
+	return @out;
+}
+
+# Run commands without a shell; tag stdout/stderr while draining both pipes.
+sub run_cmd {
+	my ($cmd, @args) = @_;
+	my ($out_read, $out_write, $err_read, $err_write, $pid, $selector, $waited, $status);
+	my ($read_error, $write_error, $close_error);
+	my $interrupted = 0;
+	my $ignore_int = defined($SIG{INT}) && $SIG{INT} eq 'IGNORE';
+
+	# Only kill the child in the handler; close pipes and reap it in normal control flow.
+	local $SIG{INT} = $ignore_int ? 'IGNORE' : sub {
+		$interrupted = 1;
+		kill('KILL', $pid) if (defined($pid) && $pid > 0);
+	};
+	pipe($out_read, $out_write) or die("Cannot create stdout pipe for '$cmd'. System error: $!\n");
+	unless (pipe($err_read, $err_write)) {
+		my $error = "$!";
+		close($out_read);
+		close($out_write);
+		die("Cannot create stderr pipe for '$cmd'. System error: $error\n");
+	}
+	$pid = fork();
+	unless (defined($pid)) {
+		my $error = "$!";
+		close($out_read);
+		close($out_write);
+		close($err_read);
+		close($err_write);
+		die("Cannot fork '$cmd'. System error: $error\n");
+	}
+	if ($pid == 0) {
+		reset_child_signals($ignore_int);
+		close($out_read);
+		close($err_read);
+		open(STDOUT, '>&', $out_write) or POSIX::_exit(127);
+		open(STDERR, '>&', $err_write) or POSIX::_exit(127);
+		close($out_write);
+		close($err_write);
+		{
+			no warnings 'exec';  # Report execution failure once, with our command prefix.
+			exec { $cmd } $cmd, @args or do {
+				print STDERR ("Cannot execute '$cmd'. System error: $!\n");
+				POSIX::_exit(127);
+			};
+		}
+	}
+	kill('KILL', $pid) if ($interrupted);
+	$close_error = "Cannot close stdout pipe for '$cmd'. System error: $!\n" unless (close($out_write));
+	$close_error //= "Cannot close stderr pipe for '$cmd'. System error: $!\n" unless (close($err_write));
+	kill('KILL', $pid) if (defined($close_error));
+	my ($label) = $cmd =~ m{([^/]+)\z};
+	$label //= $cmd;
+	my %streams = (
+		fileno($out_read) => { target => \*STDOUT, start => 1, after_cr => 0 },
+		fileno($err_read) => { target => \*STDERR, start => 1, after_cr => 0 }
+	);
+	$selector = IO::Select->new($out_read, $err_read);
+	local $| = 1;
+	while ($selector->count()) {
+		foreach my $fh ($selector->can_read()) {
+			my $state = $streams{fileno($fh)};
+			my ($data, $bytes);
+			$bytes = sysread($fh, $data, 4096);
+			if (!defined($bytes)) {
+				next if ($!{EINTR});
+				$read_error //= "Cannot read output from '$cmd'. System error: $!\n";
+				kill('KILL', $pid);
+			} elsif ($bytes > 0) {
+				# A broken output stream must not abort snapshot cleanup commands.
+				if (!$state->{failed} && !write_command_output($state, $label, $data)) {
+					$state->{failed} = 1;
+					unless ($ignore_int) {
+						$write_error //= "Cannot write output from '$cmd'. System error: $!\n";
+						kill('KILL', $pid);
+					}
+				}
+				next;
+			} elsif (!$state->{start} && !$state->{failed}) {
+				unless (print {$state->{target}} "\n") {
+					$state->{failed} = 1;
+					unless ($ignore_int) {
+						$write_error //= "Cannot finish output from '$cmd'. System error: $!\n";
+						kill('KILL', $pid);
+					}
+				}
+			}
+			$selector->remove($fh);
+			$close_error //= "Cannot close output pipe from '$cmd'. System error: $!\n" unless (close($fh));
+		}
+	}
+	while (1) {
+		$waited = waitpid($pid, 0);
+		last unless ($waited == -1 && $!{EINTR});
+	}
+	$status = $?;
+	my $child_pid = $pid;
+	$pid = undef;
+	die("Interrupted by SIGINT\n") if ($interrupted);
+	die("Cannot wait for '$cmd'. System error: $!\n") unless ($waited == $child_pid);
+	die($close_error // $read_error // $write_error)
+		if (defined($close_error) || defined($read_error) || defined($write_error));
+	check_cmd_status($cmd, $status);
+}
+
+# Treat CR progress updates as separate labeled lines, even across read boundaries.
+sub write_command_output {
+	my ($state, $label, $data) = @_;
+
+	$data =~ s/\A\n// if ($state->{after_cr});
+	$state->{after_cr} = ($data =~ /\r\z/);
+	$data =~ s/\r\n?/\n/g;
+	foreach my $part (split(/(?<=\n)/, $data)) {
+		my $prefix = $state->{start} ? "$label: " : '';
+		return 0 unless (print {$state->{target}} ($prefix, $part));
+		$state->{start} = ($part =~ /\n\z/);
+	}
+	return 1;
+}
+
+sub check_cmd_status {
+	my ($cmd, $status) = @_;
+
+	if ($status & 127) {
+		my $signal = $status & 127;
+		my $core = ($status & 128) ? ' (core dumped)' : '';
+		die("'$cmd' terminated by signal $signal$core\n");
+	}
+	my $code = $status >> 8;
+	die("'$cmd' exited with code $code\n") if ($code != 0);
+}
+
+# Read structured snapshot information; never parse diskutil's human-readable output.
+sub apfs_snapshots {
+	my $volume = shift();
+	my (@plist, @json, $file, $data, %seen);
+
+	@plist = exec_cmd('/usr/sbin/diskutil', 'apfs', 'listSnapshots', '-plist', $volume);
+	$file = File::Temp->new(UNLINK => 1);
+	binmode($file) or die("Cannot set binary mode on snapshot plist. System error: $!\n");
+	print {$file} @plist or die("Cannot write snapshot plist. System error: $!\n");
+	$file->flush() or die("Cannot flush snapshot plist. System error: $!\n");
+	@json = exec_cmd('/usr/bin/plutil', '-convert', 'json', '-o', '-', $file->filename);
+	$data = eval { JSON::PP::decode_json(join('', @json)) };
+	die("Cannot decode APFS snapshots for '$volume': $@") if ($@);
+	die("Invalid APFS snapshot listing for '$volume'\n")
+		unless (ref($data) eq 'HASH' && ref($data->{Snapshots}) eq 'ARRAY');
+	foreach my $snapshot (@{$data->{Snapshots}}) {
+		die("Invalid APFS snapshot entry for '$volume'\n") unless (ref($snapshot) eq 'HASH');
+		my ($uuid, $name, $xid) = @{$snapshot}{qw(SnapshotUUID SnapshotName SnapshotXID)};
+		die("Invalid APFS snapshot identity for '$volume'\n")
+			unless (defined($uuid) && !ref($uuid) &&
+				$uuid =~ /\A[[:xdigit:]]{8}(?:-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}\z/ &&
+				defined($name) && !ref($name) && length($name) &&
+				defined($xid) && !ref($xid) && $xid =~ /\A[0-9]+\z/);
+		die("Duplicate APFS snapshot UUID '$uuid' for '$volume'\n") if ($seen{$uuid}++);
+	}
+	return $data->{Snapshots};
+}
+
+# Identify the new Data-volume snapshot by tmutil timestamp and a previously unseen UUID.
+sub create_apfs_snapshot {
+	my $volume = shift();
+	my (@before, @out, @after, @dates, $name, %known);
+
+	@before = @{apfs_snapshots($volume)};
+	@out = exec_cmd('/usr/bin/tmutil', 'localsnapshot');
+	foreach my $line (@out) {
+		push(@dates, $1) if ($line =~ /\ACreated local snapshot with date: (\d{4}-\d{2}-\d{2}-\d{6})\s*\z/);
+	}
+	die("Cannot identify snapshot created by tmutil (unexpected output)\n") unless (@dates == 1);
+	$name = "com.apple.TimeMachine.$dates[0].local";
+	%known = map { $_->{SnapshotUUID} => 1 } @before;
+	@after = grep { $_->{SnapshotName} eq $name && !exists($known{$_->{SnapshotUUID}}) }
+		@{apfs_snapshots($volume)};
+	die("Cannot uniquely identify newly created snapshot '$name' on '$volume'\n") unless (@after == 1);
+	return { map { $_ => $after[0]->{$_} } qw(SnapshotUUID SnapshotName SnapshotXID) };
+}
+
+# Delete only a snapshot whose UUID, name and XID still match the stored identity.
+sub delete_apfs_snapshot {
+	my ($volume, $snapshot) = @_;
+	my (@found, @after);
+
+	die("Invalid snapshot identity for deletion\n")
+		unless (ref($snapshot) eq 'HASH' && defined($snapshot->{SnapshotUUID}) &&
+			defined($snapshot->{SnapshotName}) && defined($snapshot->{SnapshotXID}));
+	@found = grep { $_->{SnapshotUUID} eq $snapshot->{SnapshotUUID} } @{apfs_snapshots($volume)};
+	return 0 unless (@found);  # Purgeable snapshots can disappear before cleanup.
+	die("APFS snapshot identity changed for '$snapshot->{SnapshotUUID}'\n")
+		unless ($found[0]->{SnapshotName} eq $snapshot->{SnapshotName} &&
+			$found[0]->{SnapshotXID} eq $snapshot->{SnapshotXID});
+	run_cmd('/usr/sbin/diskutil', 'apfs', 'deleteSnapshot', $volume, '-uuid', $snapshot->{SnapshotUUID}, '-wait');
+	@after = grep { $_->{SnapshotUUID} eq $snapshot->{SnapshotUUID} } @{apfs_snapshots($volume)};
+	die("APFS snapshot '$snapshot->{SnapshotUUID}' still exists after deletion\n") if (@after);
+	return 1;
+}
+
+# Get the mount record for our canonical, private mountpoint.
+sub snapshot_mount_info {
+	my $mountpoint = shift();
+	my @lines = exec_cmd('/sbin/mount');
+	my @matches;
+
+	foreach my $line (@lines) {
+		if ($line =~ /\A(.+?) on \Q$mountpoint\E \(([^)]*)\)\s*\z/) {
+			push(@matches, { source => $1, options => $2 });
+		}
+	}
+	die("Multiple mounts found at '$mountpoint'\n") if (@matches > 1);
+	return $matches[0];
+}
+
+# Create a private mountpoint using the physical /private/tmp path, not the /tmp symlink.
+sub new_snapshot_mountpoint {
+	my $mountpoint = File::Temp::tempdir('mac-home-backup-snap-XXXXXXXX', DIR => '/private/tmp', CLEANUP => 0);
+
+	die("Invalid private snapshot mountpoint '$mountpoint'\n")
+		unless ($mountpoint =~ m{\A/private/tmp/mac-home-backup-snap-[A-Za-z0-9_]{8}\z});
+	return $mountpoint;
+}
+
+# Validate the snapshot mount before accessing its contents or detaching it.
+sub check_snapshot_mount {
+	my ($mountpoint, $snapshot) = @_;
+	my $info = snapshot_mount_info($mountpoint);
+
+	die("Snapshot is not mounted at '$mountpoint'\n") unless (defined($info));
+	die("Unexpected filesystem '$info->{source}' mounted at '$mountpoint'\n")
+		unless ($info->{source} =~ /\A\Q$snapshot->{SnapshotName}\E\@/);
+	die("Snapshot mount at '$mountpoint' is not read-only APFS\n")
+		unless ($info->{options} =~ /(?:\A|,\s*)apfs(?:,|\z)/ &&
+			$info->{options} =~ /(?:\A|,\s*)read-only(?:,|\z)/);
+	return 1;
+}
+
+# Mount only a verified snapshot into an empty, private directory.
+sub mount_apfs_snapshot {
+	my ($volume, $snapshot, $mountpoint) = @_;
+
+	die("Invalid snapshot mountpoint '$mountpoint'\n")
+		unless (defined($mountpoint) &&
+			$mountpoint =~ m{\A/private/tmp/mac-home-backup-snap-[A-Za-z0-9_]{8}\z});
+	lstat($mountpoint) or die("Cannot access mountpoint '$mountpoint'. System error: $!\n");
+	die("Unsafe snapshot mountpoint '$mountpoint'\n") unless (-d _ && !-l _);
+	opendir(my $dh, $mountpoint) or die("Cannot open mountpoint '$mountpoint'. System error: $!\n");
+	my (@entries, $read_error);
+	{
+		local $! = 0;
+		@entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+		$read_error = "$!" if ($!);
+	}
+	my $closed = closedir($dh);
+	die("Cannot read mountpoint '$mountpoint'. System error: $read_error\n") if (defined($read_error));
+	die("Cannot close mountpoint '$mountpoint'. System error: $!\n") unless ($closed);
+	die("Snapshot mountpoint '$mountpoint' is not empty\n") if (@entries);
+	die("Snapshot mountpoint '$mountpoint' is already mounted\n")
+		if (defined(snapshot_mount_info($mountpoint)));
+	my @found = grep { $_->{SnapshotUUID} eq $snapshot->{SnapshotUUID} } @{apfs_snapshots($volume)};
+	die("Snapshot '$snapshot->{SnapshotUUID}' is unavailable or its identity changed\n")
+		unless (@found == 1 && $found[0]->{SnapshotName} eq $snapshot->{SnapshotName} &&
+			$found[0]->{SnapshotXID} eq $snapshot->{SnapshotXID});
+	run_cmd('/sbin/mount_apfs', '-o', 'rdonly,nobrowse', '-s', $snapshot->{SnapshotName}, $volume, $mountpoint);
+	check_snapshot_mount($mountpoint, $snapshot);
+	return 1;
+}
+
+# Never unmount a filesystem unless it is the snapshot we expect.
+sub unmount_apfs_snapshot {
+	my ($mountpoint, $snapshot) = @_;
+
+	die("Invalid snapshot mountpoint '$mountpoint'\n")
+		unless (defined($mountpoint) &&
+			$mountpoint =~ m{\A/private/tmp/mac-home-backup-snap-[A-Za-z0-9_]{8}\z});
+	my $info = snapshot_mount_info($mountpoint);
+	if (defined($info)) {
+		check_snapshot_mount($mountpoint, $snapshot);
+		run_cmd('/sbin/umount', $mountpoint);
+		die("Snapshot remains mounted at '$mountpoint' after unmount\n")
+			if (defined(snapshot_mount_info($mountpoint)));
+	}
+	lstat($mountpoint) or die("Cannot access mountpoint '$mountpoint'. System error: $!\n");
+	die("Unsafe snapshot mountpoint '$mountpoint'\n") unless (-d _ && !-l _);
+	rmdir($mountpoint) or die("Cannot remove mountpoint '$mountpoint'. System error: $!\n");
+	return 1;
+}
+
+# Always release the mount before deleting our snapshot, even after callback failure.
+sub with_apfs_snapshot {
+	my ($volume, $work, $progress) = @_;
+	my ($snapshot, $mountpoint, $result, $error, @errors, @progress_errors);
+	my $mounted = 0;
+
+	local $SIG{INT} = 'IGNORE';
+	$progress //= sub {};  # Silent when used directly by tests or other callers.
+	my $ok = eval {
+		local $SIG{INT} = sub { die("Interrupted by SIGINT\n") };
+		$progress->('Creating APFS snapshot...');
+		$snapshot = create_apfs_snapshot($volume);
+		$progress->('Mounting snapshot (read-only)...');
+		{
+			local $SIG{INT} = 'IGNORE';
+			$mountpoint = new_snapshot_mountpoint();
+		}
+		mount_apfs_snapshot($volume, $snapshot, $mountpoint);
+		$mounted = 1;
+		$result = $work->($mountpoint, $snapshot);
+		1;
+	};
+	$error = $@ unless ($ok);
+	{
+		# Do not let progress reporting interfere with resource cleanup.
+		local $SIG{INT} = 'IGNORE';
+		local $SIG{TERM} = 'IGNORE';
+		if (defined($mountpoint)) {
+			eval { $progress->($mounted ? 'Unmounting snapshot...' : 'Cleaning up snapshot mount...'); 1 }
+				or push(@progress_errors, "Cannot report snapshot unmount: $@");
+			eval { unmount_apfs_snapshot($mountpoint, $snapshot); 1 }
+				or push(@errors, "Cannot clean up snapshot mount: $@");
+		}
+		if (defined($snapshot) && !@errors) {
+			eval { $progress->('Deleting snapshot...'); 1 }
+				or push(@progress_errors, "Cannot report snapshot deletion: $@");
+			eval { delete_apfs_snapshot($volume, $snapshot); 1 }
+				or push(@errors, "Cannot delete snapshot: $@");
+		}
+	}
+	die(($error // '') . join('', @errors, @progress_errors))
+		if (defined($error) || @errors || @progress_errors);
+	return $result;
+}
+
+# Map HOME into the mounted Data snapshot, rejecting symlink traversal and alias paths.
+sub snapshot_source_root {
+	my ($mountpoint, $home, $mode) = @_;
+
+	die("Invalid HOME path\n") unless (defined($home) && $home =~ m{\A/});
+	my $relative = substr($home, 1);
+	die("Invalid HOME path '$home'\n") unless (length($relative));
+	my $decoded = eval { Encode::decode('UTF-8', $relative, Encode::FB_CROAK) };
+	die("Invalid UTF-8 in HOME path\n") if ($@);
+	my @components = split(m{/}, $decoded, -1);
+	die("Invalid HOME path '$home'\n")
+		if (grep { $_ eq '' || $_ eq '.' || $_ eq '..' } @components);
+	my $actual = resolve_source_path($mountpoint, $decoded);
+	my $root = "$mountpoint/" . Encode::encode('UTF-8', $actual);
+	lstat($root) or die("Cannot access snapshot HOME '$root'. System error: $!\n");
+	die("Snapshot HOME '$root' is not a directory\n") unless (-d _);
+	if ($mode eq 'library') {
+		my $library = resolve_source_path($root, 'Library');
+		$root .= '/' . Encode::encode('UTF-8', $library);
+		lstat($root) or die("Cannot access snapshot Library '$root'. System error: $!\n");
+		die("Snapshot Library '$root' is not a directory\n") unless (-d _);
+	} elsif ($mode ne 'home') {
+		die("Invalid backup mode '$mode'\n");
+	}
+	return $root;
+}
+
+# Use the same path and type selection for archiving and manifest verification.
+sub aa_filter_args {
+	my ($mode, $paths) = @_;
+	my ($option, @args);
+
+	$option = $mode eq 'home' ? '-exclude-regex' : '-include-regex';
+	foreach my $actual (@{$paths}) {
+		my $regex = '^' . quotemeta($actual) . '(/|$)';
+		push(@args, $option, Encode::encode('UTF-8', $regex));
+	}
+	return (@args, '-exclude-type', 'spbc');
+}
+
+# Resolve the same literal paths for Apple Archive filters and access preflight.
+sub resolve_filter_paths {
+	my ($root, $mode, $cfg) = @_;
+	my (@paths, @actual, %seen);
+
+	if ($mode eq 'home') {
+		@paths = ('Library', @{$cfg->{home_exclude}});
+	} elsif ($mode eq 'library') {
+		@paths = @{$cfg->{library_include}};
+		die("No 'library_include' paths in configuration\n") unless (@paths);
+	} else {
+		die("Invalid backup mode '$mode'\n");
+	}
+	foreach my $path (@paths) {
+		my $name = resolve_source_path($root, $path);
+		if (exists($seen{$name})) {
+			next if ($mode eq 'home' && $name eq 'Library');
+			die("Duplicate '$mode' path '$path' after filesystem resolution\n");
+		}
+		$seen{$name} = 1;
+		push(@actual, $name);
+	}
+	return @actual;
+}
+
+# Check readable archive objects on the mounted snapshot, without following symlinks.
+sub check_source_access {
+	my ($root, $mode, $paths) = @_;
+	my %count = (directories => 0, files => 0, symlinks => 0, special => 0);
+
+	if ($mode eq 'home') {
+		my %excluded = map { Encode::encode('UTF-8', $_) => 1 } @{$paths};
+		check_source_tree($root, '', \%excluded, \%count);
+	} else {
+		# Nested includes are already covered when their parent directory is selected.
+		my @roots;
+		PATH: foreach my $path (sort { length($a) <=> length($b) } @{$paths}) {
+			foreach my $parent (@roots) {
+				next PATH if ($path eq $parent || index($path, "$parent/") == 0);
+			}
+			push(@roots, $path);
+		}
+		foreach my $path (@roots) {
+			my $bytes = Encode::encode('UTF-8', $path);
+			check_source_tree("$root/$bytes", $bytes, undef, \%count);
+		}
+	}
+	return \%count;
+}
+
+sub check_source_tree {
+	my ($path, $relative, $excluded, $count) = @_;
+
+	return if (defined($excluded) && exists($excluded->{$relative}));
+	lstat($path) or die("Cannot access source object '$path'. System error: $!\n");
+	if (-l _) {
+		my $target = readlink($path);
+		die("Cannot read source symlink '$path'. System error: $!\n") unless (defined($target));
+		$count->{symlinks}++;
+		return;
+	}
+	if (-f _) {
+		my $fh;
+		sysopen($fh, $path, Fcntl::O_RDONLY() | Fcntl::O_NOFOLLOW())
+			or die("Cannot open source file '$path'. System error: $!\n");
+		close($fh) or die("Cannot close source file '$path'. System error: $!\n");
+		$count->{files}++;
+		return;
+	}
+	if (-d _) {
+		my ($dh, @entries, $read_error, $closed);
+		die("Cannot traverse source directory '$path' (search permission denied)\n") unless (-x $path);
+		opendir($dh, $path) or die("Cannot open source directory '$path'. System error: $!\n");
+		{
+			local $! = 0;
+			@entries = readdir($dh);
+			$read_error = "$!" if ($!);
+		}
+		$closed = closedir($dh);
+		die("Cannot read source directory '$path'. System error: $read_error\n") if (defined($read_error));
+		die("Cannot close source directory '$path'. System error: $!\n") unless ($closed);
+		$count->{directories}++;
+		foreach my $entry (@entries) {
+			next if ($entry eq '.' || $entry eq '..');
+			my $child = length($relative) ? "$relative/$entry" : $entry;
+			check_source_tree("$path/$entry", $child, $excluded, $count);
+		}
+		return;
+	}
+	if (-p _ || -S _ || -b _ || -c _) {
+		$count->{special}++;  # Skip FIFO, socket and device nodes; do not open or archive them.
+		return;
+	}
+	die("Unsupported source object type '$path'\n");
+}
+
+# Resolve each component to its exact filesystem spelling, without traversing symlinks.
+sub resolve_source_path {
+	my ($root, $path) = @_;
+	my ($directory, @actual);
+
+	lstat($root) or die("Cannot access backup source '$root'. System error: $!\n");
+	die("Backup source '$root' is not a directory\n") unless (-d _);
+	$directory = $root;
+	my @components = split(m{/}, $path, -1);
+	foreach my $i (0 .. $#components) {
+		my $component = $components[$i];
+		my $wanted = Unicode::Normalize::NFC($component);
+		my ($dh, @entries, @matches);
+		opendir($dh, $directory) or die("Cannot open source directory '$directory'. System error: $!\n");
+		{
+			local $! = 0;
+			@entries = readdir($dh);
+			my $error = "$!" if ($!);
+			my $closed = closedir($dh);
+			die("Cannot read source directory '$directory'. System error: $error\n") if (defined($error));
+			die("Cannot close source directory '$directory'. System error: $!\n") unless ($closed);
+		}
+		foreach my $entry (@entries) {
+			next if ($entry eq '.' || $entry eq '..');
+			my $name = eval { Encode::decode('UTF-8', $entry, Encode::FB_CROAK | Encode::LEAVE_SRC) };
+			next if ($@);  # An invalid UTF-8 filename cannot match a UTF-8 configuration path.
+			push(@matches, [$entry, $name]) if (Unicode::Normalize::NFC($name) eq $wanted);
+		}
+		die("Configured path '$path' does not exist under '$root'\n") unless (@matches);
+		die("Ambiguous component '$component' in configured path '$path' under '$root'\n")
+			if (@matches > 1);
+		my ($entry, $name) = @{$matches[0]};
+		my $next = "$directory/$entry";
+		lstat($next) or die("Cannot access source path '$next'. System error: $!\n");
+		if ($i < $#components) {
+			die("Configured path '$path' traverses symbolic link '$next'\n") if (-l _);
+			die("Configured path '$path' has non-directory component '$next'\n") unless (-d _);
+		}
+		push(@actual, $name);
+		$directory = $next;
+	}
+	return join('/', @actual);
+}
+
+sub parse_options {
+	my (%opts, $res, $err);
+	my $parser = Getopt::Long::Parser->new(config => [qw(no_auto_abbrev no_ignore_case bundling require_order)]);
+
+	# Preserve Getopt::Std's special long help/version behavior.
+	foreach my $arg (@ARGV) {
+		if ($arg eq '--help' || $arg eq '--version') {
+			ver_msg(\*STDOUT);
+			help_msg(\*STDOUT) if ($arg eq '--help');
+			exit(0);
+		}
+		die("Long options are not supported (except --help and --version)\n")
+			if ($arg =~ /\A--/ && $arg ne '--');
+	}
+	{
+		open(local(*STDERR), '>', \$err) or die("Cannot capture command-line errors. System error: $!\n");
+		$res = $parser->getoptionsfromarray(\@ARGV, \%opts, qw(h v b r m=s a=s p=s@));
+	}
+	unless ($res) {
+		$err //= '';
+		$err =~ s/\s+\z//;
+		die("Invalid command-line options: $err\n") if (length($err));
+		die("Invalid command line: missing option argument\n");
+	}
+	die("Unexpected command-line arguments: @ARGV\n") if (@ARGV);
+	if (exists($opts{h}) || exists($opts{v})) {
+		cmd_opt_comb_err(\%opts) unless (keys(%opts) == 1);
+		ver_msg(\*STDOUT);
+		help_msg(\*STDOUT) if (exists($opts{h}));
+		exit(0);
+	}
+	die("Exactly one operation is required (use -b or -r)\n")
+		if (exists($opts{b}) == exists($opts{r}));
+	if (exists($opts{b})) {
+		cmd_opt_comb_err(\%opts) if (exists($opts{a}) || exists($opts{p}));
+		die("Backup mode is required (use -m home or -m library)\n") unless (exists($opts{m}));
+		die("Invalid backup mode '$opts{m}' (expected home or library)\n")
+			unless ($opts{m} eq 'home' || $opts{m} eq 'library');
+		return { operation => 'backup', mode => $opts{m} };
+	}
+	cmd_opt_comb_err(\%opts) if (exists($opts{m}));
+	die("Restore archive is required (use -a ARCHIVE)\n")
+		unless (exists($opts{a}) && length($opts{a}));
+	die("At least one restore path is required (use -p FSOBJ)\n")
+		unless (exists($opts{p}) && @{$opts{p}});
+	die("Empty restore path (-p)\n") if (grep { !length($_) } @{$opts{p}});
+	return { operation => 'restore', archive => $opts{a}, paths => $opts{p} };
+}
+
+sub parse_config {
+	my $fn = shift();
+	my ($fh, %cfg, %seen);
+
+	%cfg = (home_exclude => [], library_include => []);
+	open($fh, '<:raw', $fn) or die("Cannot open configuration file '$fn'. System error: $!\n");
+	die("Configuration file '$fn' is not a regular file\n") unless (-f $fh);
+	local $! = 0;
+	my $line_no = 0;
+	while (defined(my $line = <$fh>)) {
+		$line_no++;
+		my $decoded = eval { Encode::decode('UTF-8', $line, Encode::FB_CROAK) };
+		die("Invalid UTF-8 in configuration file '$fn' (line $line_no)\n") if ($@);
+		$line = $decoded;
+		$line =~ s/\r?\n\z//;
+		next if ($line =~ /\A\s*(?:#|\z)/);
+		unless ($line =~ /\A\s*([a-z_]+)\s*=\s*(.*?)\s*\z/) {
+			die("Malformed configuration line $line_no in '$fn': $line\n");
+		}
+		my ($key, $path) = ($1, $2);
+		die("Unknown configuration key '$key' in '$fn' (line $line_no)\n") unless (exists($cfg{$key}));
+		die("Empty path for '$key' in '$fn' (line $line_no)\n") unless (length($path));
+		die("Invalid control character in '$fn' (line $line_no)\n") if ($path =~ /[[:cntrl:]]/);
+		my @components = split(m{/}, $path, -1);
+		if ($path =~ m{\A/} || grep { $_ eq '' || $_ eq '.' || $_ eq '..' } @components) {
+			die("Invalid relative path '$path' in '$fn' (line $line_no)\n");
+		}
+		my $id = "$key\0$path";
+		die("Duplicate '$key' path '$path' in '$fn' (line $line_no)\n") if (exists($seen{$id}));
+		$seen{$id} = 1;
+		push(@{$cfg{$key}}, $path);
+	}
+	my $read_error = $!;
+	my $closed = close($fh);
+	die("Cannot read configuration file '$fn'. System error: $read_error\n") if ($read_error);
+	die("Cannot close configuration file '$fn'. System error: $!\n") unless ($closed);
+	return \%cfg;
+}
+
+sub cmd_opt_comb_err {
+	my $opts = shift();
+
+	my $flags = join(' ', map { "-$_" } sort(keys(%{$opts})));
+	die("Illegal combination of command-line options: $flags\n");
+}
+
+sub VERSION_MESSAGE {
+	ver_msg(\*STDOUT);
+}
+
+sub HELP_MESSAGE {
+	help_msg(\*STDOUT);
+}
+
+sub ver_msg {
+	my $fh = shift();
+
+	print $fh ("$version\n") or die("Cannot write version message. System error: $!\n");
+}
+
+sub help_msg {
+	my $fh = shift();
+
+	print $fh (
+		"\nUsage: $program -b -m MODE\n",
+		"       $program -r -a ARCHIVE -p FSOBJ [-p FSOBJ ...]\n",
+		"       $program -h | -v\n\n",
+		"Modes:\n",
+		"\thome      back up HOME, always excluding Library\n",
+		"\tlibrary   back up explicitly selected Library paths\n\n",
+		"Options:\n",
+		"\t-b        perform backup\n",
+		"\t-r        perform selective restore\n",
+		"\t-m MODE   backup mode (home or library)\n",
+		"\t-a FILE   restore archive (.aar)\n",
+		"\t-p FSOBJ  restore selected relative archive path (repeatable)\n",
+		"\t-h        print this help\n",
+		"\t-v        print the version\n\n",
+		"Configuration: ~/.mac-home-backup (required for backup only)\n",
+		"Long options: --help, --version\n",
+		"Exit status: 0 on success, 1 on error\n",
+		"Sockets, FIFOs and device nodes are excluded from backups.\n",
+		"Verified backup archives are published directly in /private/tmp.\n"
+	) or die("Cannot write help message. System error: $!\n");
+}
+
+1;
