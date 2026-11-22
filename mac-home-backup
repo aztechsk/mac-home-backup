@@ -19,7 +19,7 @@ use Digest::SHA ();
 use Unicode::Normalize ();
 
 my $program = 'mac-home-backup';
-my $version = "$program v0.1";
+my $version = "$program v1.0";
 
 # Allow tests to load command helpers without running the CLI.
 exit(main()) unless caller();
