@@ -183,7 +183,7 @@ sub restore_selected {
 		progress_msg('Recording restore target state...');
 		foreach my $entry (@{$plan->{selected}}) {
 			my $path = Encode::encode('UTF-8', $entry->{path});
-			$original{$entry->{path}} = restore_path_state("$root/$path");
+			$original{$entry->{path}} = restore_path_state("$root/$path", 1);
 		}
 		progress_msg('Creating private restore staging directory...');
 		{
@@ -249,14 +249,16 @@ sub restore_selected {
 # Snapshot target metadata to detect changes between preflight and each rename.
 # A missing target is valid, unlike a missing ancestor.
 sub restore_path_state {
-	my $path = shift();
+	my ($path, $original_target) = @_;
 
 	my @info = lstat($path);
 	if (!@info) {
 		die("Cannot inspect restore object '$path'. System error: $!\n") unless ($!{ENOENT});
 		return undef;
 	}
-	return [@info[0, 1, 2, 7, 9, 10]];
+	# Replacing another hardlink can change this inode's ctime without modifying this target.
+	my $ctime = ($original_target && -f _ && !-l _ && $info[3] > 1) ? undef : $info[10];
+	return [@info[0, 1, 2, 7, 9], $ctime];
 }
 
 sub assert_restore_state {
@@ -265,7 +267,9 @@ sub assert_restore_state {
 
 	die("Restore object changed during operation '$path'\n")
 		unless (defined($actual) == defined($expected) &&
-			(!defined($expected) || join(',', @{$actual}) eq join(',', @{$expected})));
+			(!defined($expected) ||
+				(join(',', @{$actual}[0 .. 4]) eq join(',', @{$expected}[0 .. 4]) &&
+				(!defined($expected->[5]) || $actual->[5] == $expected->[5]))));
 	return 1;
 }
 
@@ -532,7 +536,7 @@ sub check_restore_target_parents {
 	die("Unsafe restore destination root '$root'\n")
 		if (grep { $_ eq '' || $_ eq '.' || $_ eq '..' } @root_parts);
 	foreach my $entry (@{$selected}) {
-		my @parents = split(m{/}, $entry->{path}, -1);
+		my @parents = split(m{/}, Encode::encode('UTF-8', $entry->{path}), -1);
 		pop(@parents);
 		my $current = '';
 		foreach my $part (@root_parts, @parents) {
@@ -737,7 +741,7 @@ sub archive_snapshot {
 		@{$filters});
 }
 
-# Structural/nonempty check only: this does NOT verify stored file contents against SH2.
+# Validate staged archive namespace; this does NOT verify stored file contents against SH2.
 sub check_staged_archive {
 	my $archive = shift();
 	my @info = lstat($archive);
@@ -746,13 +750,8 @@ sub check_staged_archive {
 	die("Staged archive '$archive' is not a regular file\n") unless (-f _ && !-l _);
 	die("Staged archive '$archive' is empty\n") unless ($info[7] > 0);
 	chmod(0600, $archive) == 1 or die("Cannot protect staged archive '$archive'. System error: $!\n");
-	my @listing = exec_cmd('/usr/bin/aa', 'list', '-i', $archive,
-		'-list-format', 'json', '-exclude-field', 'all', '-include-field', 'pat');
-	my $entries = eval { JSON::PP::decode_json(join('', @listing)) };
-	die("Cannot decode staged archive listing '$archive': $@") if ($@);
-	die("Invalid staged archive listing '$archive'\n") unless (ref($entries) eq 'ARRAY');
-	die("Staged archive '$archive' contains no entries\n") unless (@$entries);
-	return scalar(@$entries);
+	my $index = restore_archive_index($archive);
+	return $index->{count};
 }
 
 # Read the complete archive to calculate its transfer/storage identifier.
@@ -1417,21 +1416,13 @@ sub resolve_source_path {
 
 sub parse_options {
 	my (%opts, $res, $err);
-	my $parser = Getopt::Long::Parser->new(config => [qw(no_auto_abbrev no_ignore_case bundling require_order)]);
+	# Disallow one-letter long options (e.g. --b), but allow option values beginning with --.
+	my $parser = Getopt::Long::Parser->new(config => [qw(no_auto_abbrev no_ignore_case bundling require_order),
+		'prefix_pattern=(--(?=[A-Za-z]{2})|-(?!-))']);
 
-	# Preserve Getopt::Std's special long help/version behavior.
-	foreach my $arg (@ARGV) {
-		if ($arg eq '--help' || $arg eq '--version') {
-			ver_msg(\*STDOUT);
-			help_msg(\*STDOUT) if ($arg eq '--help');
-			exit(0);
-		}
-		die("Long options are not supported (except --help and --version)\n")
-			if ($arg =~ /\A--/ && $arg ne '--');
-	}
 	{
 		open(local(*STDERR), '>', \$err) or die("Cannot capture command-line errors. System error: $!\n");
-		$res = $parser->getoptionsfromarray(\@ARGV, \%opts, qw(h v b r m=s a=s p=s@));
+		$res = $parser->getoptionsfromarray(\@ARGV, \%opts, qw(h|help v|version b r m=s a=s p=s@));
 	}
 	unless ($res) {
 		$err //= '';

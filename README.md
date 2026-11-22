@@ -172,14 +172,14 @@ The backup sequence, simplified from `stage_backup()` and
 `with_apfs_snapshot()`, is:
 
 1. Parse `~/.mac-home-backup` and validate the chosen `home`/`library` mode.
-2. Create an APFS snapshot of `/System/Volumes/Data` with `diskutil`.
+2. Create an APFS snapshot of `/System/Volumes/Data` with `tmutil localsnapshot`.
 3. Mount **that snapshot read-only**, not the mutable live HOME.
 4. Resolve configured paths to their real spelling on the snapshot, reject
    unsafe ancestor traversal, and check access to the selected filesystem
    objects.
 5. Produce a temporary Apple Archive from the snapshot.
-6. List the resulting archive and compare its entry count against the source
-   preflight count.
+6. List the resulting archive, validate its path/type namespace using the
+   restore rules, and compare its entry count against the source preflight count.
 7. Build an Apple Archive manifest **from the archive**, then `aa verify` it
    against the same mounted snapshot using the same selection filters.
 8. Remove the temporary manifest; unmount and delete the snapshot.
@@ -208,7 +208,7 @@ Notable fields and their purpose:
 | `DAT`, `SIZ`, `DUZ`, `SH2` | File data, size/storage information, SHA-256-related data field |
 | `LNK`, `HLC` | Symbolic-link target and hard-link cluster metadata |
 | `UID`, `GID`, `MOD`, `FLG` | Ownership, permissions, and filesystem flags |
-| `MTM`, `CTM`, `BTM` | Modification, change, and birth time metadata |
+| `MTM`, `CTM`, `BTM` | Modification, creation, and backup time metadata |
 | `XAT`, `ACL` | Extended attributes and access-control lists |
 | `DEV` | Device-related archive metadata |
 
